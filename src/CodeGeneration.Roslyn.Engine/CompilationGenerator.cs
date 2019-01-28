@@ -8,16 +8,14 @@ namespace CodeGeneration.Roslyn.Engine
     using System.IO;
     using System.Linq;
     using System.Reflection;
-    using System.Runtime.Loader;
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
+    using McMaster.NETCore.Plugins;
     using Microsoft.CodeAnalysis;
     using Microsoft.CodeAnalysis.CSharp;
     using Microsoft.CodeAnalysis.CSharp.Syntax;
     using Microsoft.CodeAnalysis.Text;
-    using Microsoft.Extensions.DependencyModel;
-    using Microsoft.Extensions.DependencyModel.Resolution;
     using Validation;
 
     /// <summary>
@@ -28,16 +26,12 @@ namespace CodeGeneration.Roslyn.Engine
     {
         private const string InputAssembliesIntermediateOutputFileName = "CodeGeneration.Roslyn.InputAssemblies.txt";
         private const int ProcessCannotAccessFileHR = unchecked((int)0x80070020);
-        private static readonly HashSet<string> AllowedAssemblyExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".dll" };
 
         private readonly List<string> emptyGeneratedFiles = new List<string>();
         private readonly List<string> generatedFiles = new List<string>();
         private readonly List<string> additionalWrittenFiles = new List<string>();
         private readonly List<string> loadedAssemblies = new List<string>();
-        private readonly Dictionary<string, Assembly> assembliesByPath = new Dictionary<string, Assembly>();
-        private readonly HashSet<string> directoriesWithResolver = new HashSet<string>();
-        private CompositeCompilationAssemblyResolver assemblyResolver;
-        private DependencyContext dependencyContext;
+        private readonly Dictionary<string, (PluginLoader loader, Assembly assembly)> plugins = new Dictionary<string, (PluginLoader, Assembly)>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Gets or sets the list of paths of files to be compiled.
@@ -55,9 +49,9 @@ namespace CodeGeneration.Roslyn.Engine
         public IEnumerable<string> PreprocessorSymbols { get; set; }
 
         /// <summary>
-        /// Gets or sets the paths to directories to search for generator assemblies.
+        /// Gets or sets the paths to plugins.
         /// </summary>
-        public IReadOnlyList<string> GeneratorAssemblySearchPaths { get; set; }
+        public IReadOnlyList<string> PluginPaths { get; set; } = new List<string>();
 
         /// <summary>
         /// Gets or sets the path to the directory that contains generated source files.
@@ -85,23 +79,6 @@ namespace CodeGeneration.Roslyn.Engine
         public string ProjectDirectory { get; set; }
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="CompilationGenerator"/> class
-        /// with default dependency resolution and loading.
-        /// </summary>
-        public CompilationGenerator()
-        {
-            this.assemblyResolver = new CompositeCompilationAssemblyResolver(new ICompilationAssemblyResolver[]
-            {
-                new ReferenceAssemblyPathResolver(),
-                new PackageCompilationAssemblyResolver(),
-            });
-            this.dependencyContext = DependencyContext.Default;
-
-            var loadContext = AssemblyLoadContext.GetLoadContext(this.GetType().GetTypeInfo().Assembly);
-            loadContext.Resolving += this.ResolveAssembly;
-        }
-
-        /// <summary>
         /// Runs the code generation as configured using this instance's properties.
         /// </summary>
         /// <param name="progress">Optional handler of diagnostics provided by code generator.</param>
@@ -110,8 +87,8 @@ namespace CodeGeneration.Roslyn.Engine
         {
             Verify.Operation(this.Compile != null, $"{nameof(Compile)} must be set first.");
             Verify.Operation(this.ReferencePath != null, $"{nameof(ReferencePath)} must be set first.");
+            Verify.Operation(this.PluginPaths != null, $"{nameof(PluginPaths)} must be set first.");
             Verify.Operation(this.IntermediateOutputDirectory != null, $"{nameof(IntermediateOutputDirectory)} must be set first.");
-            Verify.Operation(this.GeneratorAssemblySearchPaths != null, $"{nameof(GeneratorAssemblySearchPaths)} must be set first.");
 
             var compilation = this.CreateCompilation(cancellationToken);
 
@@ -146,7 +123,7 @@ namespace CodeGeneration.Roslyn.Engine
                                     compilation,
                                     inputSyntaxTree,
                                     this.ProjectDirectory,
-                                    this.LoadAssembly,
+                                    this.LoadPlugin,
                                     progress).GetAwaiter().GetResult();
 
                                 var outputText = generatedSyntaxTree.GetText(cancellationToken);
@@ -195,79 +172,31 @@ namespace CodeGeneration.Roslyn.Engine
             }
         }
 
-        private Assembly LoadAssembly(string path)
+        private Assembly LoadPlugin(AssemblyName assemblyName)
         {
-            if (this.assembliesByPath.ContainsKey(path))
-                return this.assembliesByPath[path];
-
-            var loadContext = AssemblyLoadContext.GetLoadContext(this.GetType().GetTypeInfo().Assembly);
-            var assembly = loadContext.LoadFromAssemblyPath(path);
-
-            var newDependencyContext = DependencyContext.Load(assembly);
-            if (newDependencyContext != null)
-                this.dependencyContext = this.dependencyContext.Merge(newDependencyContext);
-            var basePath = Path.GetDirectoryName(path);
-            if (!this.directoriesWithResolver.Contains(basePath))
+            if (plugins.TryGetValue(assemblyName.Name, out var cached))
             {
-                this.assemblyResolver = new CompositeCompilationAssemblyResolver(new ICompilationAssemblyResolver[]
-                {
-                    new AppBaseCompilationAssemblyResolver(basePath),
-                    this.assemblyResolver,
-                });
-                this.directoriesWithResolver.Add(basePath);
+                Logger.Info($"CGR retrieved cached plugin for {assemblyName.Name}: {cached.assembly.Location}");
+                return cached.assembly;
             }
-
-            this.assembliesByPath.Add(path, assembly);
-            return assembly;
-        }
-
-        private Assembly ResolveAssembly(AssemblyLoadContext context, AssemblyName name)
-        {
-            var library = FindMatchingLibrary(this.dependencyContext.RuntimeLibraries, name);
-            if (library == null)
+            var pluginPath = PluginPaths.FirstOrDefault(IsRequestedPlugin);
+            if (pluginPath is null)
+            {
+                Logger.Info($"CGR didn't find plugin for {assemblyName.Name}");
                 return null;
-            var wrapper = new CompilationLibrary(
-                library.Type,
-                library.Name,
-                library.Version,
-                library.Hash,
-                library.RuntimeAssemblyGroups.SelectMany(g => g.AssetPaths),
-                library.Dependencies,
-                library.Serviceable);
-
-            var assemblyPaths = new List<string>();
-            this.assemblyResolver.TryResolveAssemblyPaths(wrapper, assemblyPaths);
-
-            if (assemblyPaths.Count == 0)
-            {
-                var matches = from refAssemblyPath in this.ReferencePath
-                              where Path.GetFileNameWithoutExtension(refAssemblyPath).Equals(name.Name, StringComparison.OrdinalIgnoreCase)
-                              select context.LoadFromAssemblyPath(refAssemblyPath);
-                return matches.FirstOrDefault();
             }
+            var loader = PluginLoader.CreateFromAssemblyFile(pluginPath, PluginLoaderOptions.PreferSharedTypes);
+            var assembly = loader.LoadDefaultAssembly();
+            plugins[assemblyName.Name] = (loader, assembly);
+            this.loadedAssemblies.Add(pluginPath);
+            Logger.Info($"CGR loaded plugin for {assemblyName.Name}: {assembly.Location}");
+            return assembly;
 
-            return assemblyPaths.Select(context.LoadFromAssemblyPath).FirstOrDefault();
-        }
-
-        private static RuntimeLibrary FindMatchingLibrary(IEnumerable<RuntimeLibrary> libraries, AssemblyName name)
-        {
-            foreach (var runtime in libraries)
+            bool IsRequestedPlugin(string path)
             {
-                if (string.Equals(runtime.Name, name.Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return runtime;
-                }
-
-                // If the NuGet package name does not exactly match the AssemblyName,
-                // we check whether the assembly file name is matching
-                if (runtime.RuntimeAssemblyGroups.Any(
-                        g => g.AssetPaths.Any(
-                            p => string.Equals(Path.GetFileNameWithoutExtension(p), name.Name, StringComparison.OrdinalIgnoreCase))))
-                {
-                    return runtime;
-                }
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                return string.Equals(assemblyName.Name, fileName, StringComparison.OrdinalIgnoreCase);
             }
-            return null;
         }
 
         private static DateTime GetLastModifiedAssemblyTime(string assemblyListPath)
@@ -313,26 +242,6 @@ namespace CodeGeneration.Roslyn.Engine
             var reportDiagnostic = Diagnostic.Create(descriptor, location, messageArgs);
 
             progress.Report(reportDiagnostic);
-        }
-
-        private Assembly LoadAssembly(AssemblyName assemblyName)
-        {
-            var matchingRefAssemblies = from refPath in this.ReferencePath
-                                        where Path.GetFileNameWithoutExtension(refPath).Equals(assemblyName.Name, StringComparison.OrdinalIgnoreCase)
-                                        select refPath;
-            var matchingAssemblies = from path in this.GeneratorAssemblySearchPaths
-                                     from file in Directory.EnumerateFiles(path, $"{assemblyName.Name}.dll", SearchOption.TopDirectoryOnly)
-                                     where AllowedAssemblyExtensions.Contains(Path.GetExtension(file))
-                                     select file;
-
-            string matchingRefAssembly = matchingRefAssemblies.Concat(matchingAssemblies).FirstOrDefault();
-            if (matchingRefAssembly != null)
-            {
-                this.loadedAssemblies.Add(matchingRefAssembly);
-                return this.LoadAssembly(matchingRefAssembly);
-            }
-
-            return Assembly.Load(assemblyName);
         }
 
         private void SaveGeneratorAssemblyList(string assemblyListPath)
